@@ -168,18 +168,16 @@ class UnsupportedFileException(Exception):
 
 class Keyer(object):
 
-    def stat(self, fd):
-        s = os.fstat(fd)
-        if stat.S_IFMT(s.st_mode) != stat.S_IFREG:
-            raise UnsupportedFileException("Not a regular file")
+    def stat(self, fd, stat=None):
+        s = os.fstat(fd) if stat is None else stat
         return {"size": s.st_size}
 
     def extent_map(self, fd):
         return get_map(fd)
 
-    def get_keys(self, fd):
+    def get_keys(self, fd, stat=None):
         return {
-            "stat": self.stat(fd),
+            "stat": self.stat(fd, stat),
             "extent": self.extent_map(fd)
         }
 
@@ -221,11 +219,17 @@ class Deduplicator(object):
         for root, dummy_, files in os.walk(path):
             for fname in files:
                 f = pathlib.Path(root) / fname
-                with fdopen(f, os.O_RDONLY) as fd:
-                    try:
-                        keys = keyer.get_keys(fd)
-                    except UnsupportedFileException:
+                with fdopen(f, os.O_PATH|os.O_NOFOLLOW) as fd:
+                    s = os.fstat(fd)
+                    if stat.S_IFMT(s.st_mode) != stat.S_IFREG:
+                        self.logger.warning("Skipping not regular file at %r", f)
                         continue
+                try:
+                    with fdopen(f, os.O_RDONLY) as fd:
+                        keys = keyer.get_keys(fd, stat=s)
+                except OSError as e:
+                    self.logger.warning("Skipping bad path %r: %s", f, e)
+                    continue
                 # hash index by most freq used key
                 s = self.get_info_stat_key(keys)
                 if s not in index:
