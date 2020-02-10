@@ -10,6 +10,7 @@ import stat
 import hashlib
 import contextlib
 import pathlib
+import argparse
 
 class StructureWithDefaults(ctypes.Structure):
     def __init__(self, **kwargs):
@@ -190,12 +191,28 @@ def fdopen(pathlike, flags):
     finally:
         os.close(fd)
 
+"""
+Initial:
+INFO:Deduplicator:Deduplicated 1312.34 MBytes
+real	4m50,181s
+user	4m41,533s
+sys	0m8,579s
+
+hashing index by "stat":
+INFO:Deduplicator:Deduplicated 1312.34 MBytes
+real	0m35,667s
+user	0m28,077s
+sys	0m7,513s
+"""
 class Deduplicator(object):
 
     def __init__(self, pretend=False):
         super().__init__()
         self.logger = logging.getLogger(self.__class__.__qualname__)
         self.pretend = pretend
+
+    def get_info_stat_key(self, info):
+        return str(info["stat"])
 
     def create_index(self, path):
         self.logger.info("Creating index for %r", path)
@@ -206,18 +223,23 @@ class Deduplicator(object):
                 f = pathlib.Path(root) / fname
                 with fdopen(f, os.O_RDONLY) as fd:
                     try:
-                        index[f] = keyer.get_keys(fd)
+                        keys = keyer.get_keys(fd)
                     except UnsupportedFileException:
-                        pass
+                        continue
+                # hash index by most freq used key
+                s = self.get_info_stat_key(keys)
+                if s not in index:
+                    index[s] = {}
+                index[s][f] = keys
         self._index = index
 
     def _find_similar(self, src_info):
-        for p,i in self._index.items():
+        for p,i in self._index[self.get_info_stat_key(src_info)].items():
             if src_info["stat"] == i["stat"]:
                 yield p, src_info["extent"] == i["extent"]
 
-    def handle_single(self):
-        src_path, src_info = self._index.popitem()
+    def handle_single(self, index):
+        src_path, src_info = index.popitem()
         self.logger.info("Checking file %r", src_path)
 
         pending = []
@@ -235,12 +257,12 @@ class Deduplicator(object):
                     pending.append(p)
 
         for p in handled:
-            self._index.pop(p)
+            index.pop(p)
 
         if self.pretend:
             for p in pending:
                 self.logger.info("Would deduplicate %r", p)
-                self._index.pop(p)
+                index.pop(p)
             deduplicated_bytes += len(pending) * src_info["stat"]["size"]
         else:
             if pending:
@@ -257,7 +279,7 @@ class Deduplicator(object):
                                 os.close(fd)
                         # remove handled items from index
                         for b in batch:
-                            self._index.pop(b)
+                            index.pop(b)
                         if len(batch) != batch_size:
                             break
         return deduplicated_bytes
@@ -265,11 +287,18 @@ class Deduplicator(object):
     def run(self, path):
         self.create_index(path)
         deduplicated_bytes = 0
-        while self._index:
-            deduplicated_bytes += self.handle_single()
+        for k in self._index.keys():
+            while self._index[k]:
+                deduplicated_bytes += self.handle_single(self._index[k])
         self.logger.info("Deduplicated %.2f MBytes", deduplicated_bytes / 1024 / 1024)
 
-logging.basicConfig(level=logging.INFO)
-d = Deduplicator(True)
-# d.run("/home/glorpen/q/")
-d.run("/mnt/sandbox/temp/")
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--pretend", "-p", action="store_true")
+    p.add_argument("path", action="store", type=pathlib.Path)
+
+    ns = p.parse_args()
+
+    logging.basicConfig(level=logging.INFO)
+    d = Deduplicator(pretend=ns.pretend)
+    d.run(ns.path)
