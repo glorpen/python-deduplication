@@ -11,6 +11,17 @@ import hashlib
 import contextlib
 import pathlib
 import argparse
+import multiprocessing.pool
+import math
+import itertools
+
+@contextlib.contextmanager
+def fdopen(pathlike, flags):
+    fd = os.open(pathlike, flags)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
 
 class StructureWithDefaults(ctypes.Structure):
     def __init__(self, **kwargs):
@@ -120,12 +131,11 @@ def dedup_file(src_fd, length, dst_fds):
                 raise Exception("File differs")
             if bytes_deduped > length:
                 raise Exception("Deduped %d bytes of %d requested" % (bytes_deduped, length))
-            print(bytes_deduped)
         
         logger.debug("Deduped %d bytes", lowest_deduped_bytes)
-        length -= bytes_deduped
-        src_offset += bytes_deduped
-        dst_offset += bytes_deduped
+        length -= lowest_deduped_bytes
+        src_offset += lowest_deduped_bytes
+        dst_offset += lowest_deduped_bytes
         
     return length * len(dst_fds)
 
@@ -133,7 +143,7 @@ FS_IOC_FIEMAP = IOC(IOC_WRITE|IOC_READ, ord('f'), 11, ctypes.sizeof(fiemap()))
 FIEMAP_FLAG_SYNC = 1
 FIEMAP_EXTENT_LAST = 1
 
-def get_map(fd):
+def get_extent_map(fd):
     last_logical = 0
     range_end = sys.maxsize
     extent_batch = 10
@@ -161,148 +171,224 @@ def get_map(fd):
             if e.fe_flags & FIEMAP_EXTENT_LAST:
                 done = True
                 break
-    return ret
+    return tuple(ret)
 
-class UnsupportedFileException(Exception):
-    pass
+class Index(object):
+    BUFSIZE = 1024 * 1024
 
-class Keyer(object):
-
-    def stat(self, fd, stat=None):
-        s = os.fstat(fd) if stat is None else stat
-        return {"size": s.st_size}
-
-    def extent_map(self, fd):
-        return get_map(fd)
-
-    def get_keys(self, fd, stat=None):
-        return {
-            "stat": self.stat(fd, stat),
-            "extent": self.extent_map(fd)
-        }
-
-@contextlib.contextmanager
-def fdopen(pathlike, flags):
-    fd = os.open(pathlike, flags)
-    try:
-        yield fd
-    finally:
-        os.close(fd)
-
-"""
-Initial:
-INFO:Deduplicator:Deduplicated 1312.34 MBytes
-real	4m50,181s
-user	4m41,533s
-sys	0m8,579s
-
-hashing index by "stat":
-INFO:Deduplicator:Deduplicated 1312.34 MBytes
-real	0m35,667s
-user	0m28,077s
-sys	0m7,513s
-"""
-class Deduplicator(object):
-
-    def __init__(self, pretend=False):
+    def __init__(self):
         super().__init__()
         self.logger = logging.getLogger(self.__class__.__qualname__)
-        self.pretend = pretend
+        self._path_by_size = {}
+        self._hash_by_extent = {}
+        self._info_by_path = {}
 
-    def get_info_stat_key(self, info):
-        return str(info["stat"])
+    def put(self, path, info):
+        self._info_by_path[path] = info
 
-    def create_index(self, path):
+        # index by most freq used key
+        size = info["size"]
+        if size not in self._path_by_size:
+            self._path_by_size[size] = []
+        self._path_by_size[size].append(path)
+    
+    def _get_info(self, fd, stat):
+        return {
+            "size": stat.st_size,
+            "extent": get_extent_map(fd)
+        }
+
+    def collect_files(self, path):
         self.logger.info("Creating index for %r", path)
-        keyer = Keyer()
-        index = {}
         for root, dummy_, files in os.walk(path):
             for fname in files:
                 f = pathlib.Path(root) / fname
                 with fdopen(f, os.O_PATH|os.O_NOFOLLOW) as fd:
                     s = os.fstat(fd)
-                    if stat.S_IFMT(s.st_mode) != stat.S_IFREG:
-                        self.logger.warning("Skipping not regular file at %r", f)
-                        continue
+                if stat.S_IFMT(s.st_mode) != stat.S_IFREG:
+                    self.logger.warning("Skipping not regular file at %r", f)
+                    continue
+                if s.st_size == 0:
+                    self.logger.debug("Skipping empty file at %r", f)
+                    continue
                 try:
                     with fdopen(f, os.O_RDONLY) as fd:
-                        keys = keyer.get_keys(fd, stat=s)
+                        info = self._get_info(fd, s)
                 except OSError as e:
                     self.logger.warning("Skipping bad path %r: %s", f, e)
                     continue
-                # hash index by most freq used key
-                s = self.get_info_stat_key(keys)
-                if s not in index:
-                    index[s] = {}
-                index[s][f] = keys
-        self._index = index
+                if not info["extent"]:
+                    self.logger.warning('No extents found for %r, insufficient permissions?', f)
+                    continue
+                
+                self.put(f, info)
+    
+    @classmethod
+    def _calculate_hash(cls, path):
+        h = hashlib.md5()
+        with open(path, "rb") as f:
+            while True:
+                data = f.read(cls.BUFSIZE)
+                if not data:
+                    break
+                h.update(data)
+        return h.digest()
+    
+    @classmethod
+    def _hash_collector_worker(cls, infos):
+        ret = []
+        for extent, path in infos:
+            ret.append((extent, cls._calculate_hash(path)))
+        return ret
 
-    def _find_similar(self, src_info):
-        for p,i in self._index[self.get_info_stat_key(src_info)].items():
-            if src_info["stat"] == i["stat"]:
-                yield p, src_info["extent"] == i["extent"]
+    def collect_hashes(self, workers=None, batch_size=200):
+        self.logger.info("Collecting hashes")
+        progress_tracker = {
+            "total": len(self._info_by_path),
+            "skipped": 0,
+            "hashed": 0
+        }
+        def path_iter():
+            known_extents = set()
+            for ps in self._path_by_size.values():
+                # calculate hash only if there is need for comparison
+                if len(ps) < 3:
+                    continue
+                for p in ps:
+                    extent_offset = self._info_by_path[p]["extent"]
+                    if extent_offset in known_extents:
+                        progress_tracker["skipped"]+=1
+                        continue
+                    known_extents.add(extent_offset)
+                    yield extent_offset, p
+        def hash_iter(batch_size):
+            i = path_iter()
+            while True:
+                ret = list(itertools.islice(i, batch_size))
+                if not ret:
+                    raise StopIteration()
+                yield ret
+        
+        with multiprocessing.pool.Pool(workers) as pool:
+            for batch in pool.imap_unordered(self._hash_collector_worker, hash_iter(batch_size)):
+                for extent, hash_ in batch:
+                    if extent not in self._hash_by_extent:
+                        self._hash_by_extent[extent] = {}
+                    self._hash_by_extent[extent] = hash_
+                    progress_tracker["hashed"]+=1
 
-    def handle_single(self, index):
-        src_path, src_info = index.popitem()
-        self.logger.info("Checking file %r", src_path)
+    def __iter__(self):
+        return iter(self._info_by_path.keys())
+    def __len__(self):
+        return len(self._info_by_path)
+    
+    def get_size(self, path):
+        return self._info_by_path[path]["size"]
 
-        pending = []
-        handled = []
+    def find_similar(self, src_path):
+        src_info = self._info_by_path[src_path]
+        src_extent = src_info["extent"]
+        src_hash = self._hash_by_extent.get(src_extent, None)
+
+        paths = set(self._path_by_size[src_info["size"]])
+        paths.discard(src_path)
+
+        same = []
+        similar = []
+
+        # there are few files with this size so no hash was computed
+        if src_hash is None:
+            similar.extend(paths)
+            return same, similar
+        # if src_hash exist then all files in size group should have it computed
+
+        for p in paths:
+            ex = self._info_by_path[p]["extent"]
+            if ex == src_extent:
+                same.append(p)
+            else:
+                if self._hash_by_extent[ex] == src_hash:
+                    similar.append(p)
+        
+        return same, similar
+
+class Deduplicator(object):
+
+    def __init__(self, index, pretend=False):
+        super().__init__()
+        self.logger = logging.getLogger(self.__class__.__qualname__)
+        self.pretend = pretend
+        self.index = index
+
+    def run(self):
+        handled = set()
+        deduplicated_files = 0
         deduplicated_bytes = 0
         
-        for p, extent_matches in self._find_similar(src_info):
-            if extent_matches:
-                handled.append(p)
-            else:
-                # TODO: when comparing, calculate some simple hash,
-                # so later we can find similar files quickier
+        for src_path in self.index:
+            if src_path in handled:
+                continue
+
+            self.logger.debug("Checking %r", src_path)
+            
+            same, similar = self.index.find_similar(src_path)
+            handled.update(same)
+            handled.add(src_path)
+
+            self.logger.debug("Found %d same and %d similar files", len(same), len(similar))
+
+            pending = []
+            
+            for p in similar:
                 if file_cmp(src_path, p, shallow=False):
                     self.logger.debug("Found duplicate: %r", p)
                     pending.append(p)
-
-        for p in handled:
-            index.pop(p)
-
-        if self.pretend:
-            for p in pending:
-                self.logger.info("Would deduplicate %r", p)
-                index.pop(p)
-            deduplicated_bytes += len(pending) * src_info["stat"]["size"]
-        else:
+                    handled.add(p)
+                    deduplicated_files += 1
+            
             if pending:
-                offset = 0
-                batch_size = 10
-                with fdopen(src_path, os.O_RDWR) as src_fd:
-                    while True:
-                        batch = pending[offset:offset+batch_size]
-                        fds = [os.open(i, os.O_RDWR) for i in batch]
-                        try:
-                            deduplicated_bytes += dedup_file(src_fd, src_info["stat"]["size"], fds)
-                        finally:
-                            for fd in fds:
-                                os.close(fd)
-                        # remove handled items from index
-                        for b in batch:
-                            index.pop(b)
-                        if len(batch) != batch_size:
-                            break
-        return deduplicated_bytes
-    
-    def run(self, path):
-        self.create_index(path)
-        deduplicated_bytes = 0
-        for k in self._index.keys():
-            while self._index[k]:
-                deduplicated_bytes += self.handle_single(self._index[k])
-        self.logger.info("Deduplicated %.2f MBytes", deduplicated_bytes / 1024 / 1024)
+                if not self.pretend:
+                    self._run_dedupe(src_path, pending)
+                deduplicated_bytes += len(pending) * self.index.get_size(src_path)
+
+
+        self.logger.debug("Deduplicated %.2f MBytes in %d files.", deduplicated_bytes/1024/1024, deduplicated_files)
+
+
+    def _run_dedupe(self, src_path, dst_paths, batch_size=10):
+        size = self.index.get_size(src_path)
+        
+        offset = 0
+        with fdopen(src_path, os.O_RDWR) as src_fd:
+            while True:
+                batch = dst_paths[offset:offset+batch_size]
+                if not batch:
+                    break
+                self.logger.debug("Deduping %r", batch)
+                fds = [os.open(i, os.O_RDWR) for i in batch]
+                try:
+                    dedup_file(src_fd, size, fds)
+                finally:
+                    for fd in fds:
+                        os.close(fd)
+                if len(batch) != batch_size:
+                    break
+                offset += batch_size
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
+
     p = argparse.ArgumentParser()
     p.add_argument("--pretend", "-p", action="store_true")
+    p.add_argument("--hash-workers", action="store", type=int, default=math.ceil(os.cpu_count()/2))
+    p.add_argument("--hash-batch-size", action="store", type=int, default=200)
     p.add_argument("path", action="store", type=pathlib.Path)
-
+    
     ns = p.parse_args()
 
-    logging.basicConfig(level=logging.INFO)
-    d = Deduplicator(pretend=ns.pretend)
-    d.run(ns.path)
+    index = Index()
+    index.collect_files(ns.path)
+    index.collect_hashes(workers=ns.hash_workers, batch_size=ns.hash_batch_size)
+
+    d = Deduplicator(pretend=ns.pretend, index=index)
+    d.run()
