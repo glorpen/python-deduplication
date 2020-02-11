@@ -364,13 +364,13 @@ class Deduplicator(object):
         size = self.index.get_size(src_path)
         
         offset = 0
-        with fdopen(src_path, os.O_RDWR) as src_fd:
+        with fdopen(src_path, os.O_RDONLY) as src_fd:
             while True:
                 batch = dst_paths[offset:offset+batch_size]
                 if not batch:
                     break
                 self.logger.debug("Deduping %r", batch)
-                fds = [os.open(i, os.O_RDWR) for i in batch]
+                fds = [os.open(i, os.O_RDONLY) for i in batch]
                 try:
                     dedup_file(src_fd, size, fds)
                 finally:
