@@ -507,7 +507,7 @@ if __name__ == "__main__":
     
     bar.close()
 
-    bar.write("""Deduplicate stats:
+    bar.write("""Deduplicated {deduped_bytes} in {run_time}s:
   - checked {handled_files} files
   - found {duplicated_files} files that have duplicates
   - deduplicated {deduped_bytes} in {deduped_files} files
@@ -518,5 +518,6 @@ if __name__ == "__main__":
         deduped_files=progress.deduped_files,
         deduped_bytes=format_bytes(progress.deduped_bytes),
         same_bytes=format_bytes(progress.same_bytes),
-        same_files=progress.same_files
+        same_files=progress.same_files,
+        run_time=bar.format_interval(bar.last_print_t - bar.start_t)
     ))
