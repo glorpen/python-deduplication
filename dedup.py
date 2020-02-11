@@ -123,14 +123,14 @@ def dedup_file(src_fd, length, dst_fds):
             bytes_deduped = info.bytes_deduped
             status = info.status
 
-            lowest_deduped_bytes = min(lowest_deduped_bytes, bytes_deduped)
-            
             if status < 0:
                 raise OSError(-status, os.strerror(-status))
             if status == XFS_EXTENT_DATA_DIFFERS:
                 raise Exception("File differs")
             if bytes_deduped > length:
                 raise Exception("Deduped %d bytes of %d requested" % (bytes_deduped, length))
+            
+            lowest_deduped_bytes = min(lowest_deduped_bytes, bytes_deduped)
         
         logger.debug("Deduped %d bytes", lowest_deduped_bytes)
         length -= lowest_deduped_bytes
@@ -143,9 +143,12 @@ FS_IOC_FIEMAP = IOC(IOC_WRITE|IOC_READ, ord('f'), 11, ctypes.sizeof(fiemap()))
 FIEMAP_FLAG_SYNC = 1
 FIEMAP_EXTENT_LAST = 1
 
-def get_extent_map(fd):
+def get_extent_map(fd, range_end = None):
     last_logical = 0
-    range_end = sys.maxsize
+    if range_end is None:
+        range_end = sys.maxsize
+    
+    # buffer to store extents info from kernel
     extent_batch = 10
 
     req = fiemap(fm_extent_count=extent_batch)()
@@ -171,6 +174,7 @@ def get_extent_map(fd):
             if e.fe_flags & FIEMAP_EXTENT_LAST:
                 done = True
                 break
+    
     return tuple(ret)
 
 class Index(object):
@@ -193,9 +197,14 @@ class Index(object):
         self._path_by_size[size].append(path)
     
     def _get_info(self, fd, stat):
+        # get only first extent since it seems that you cannot
+        # dedup unfilled blocks - or it is just not reported by femap,
+        # so we cannot check if all of data is deduped
+        extents = get_extent_map(fd)
+        first_extent = extents[0] if extents else None
         return {
             "size": stat.st_size,
-            "extent": get_extent_map(fd)
+            "extent": first_extent,
         }
 
     def collect_files(self, path):
@@ -296,18 +305,14 @@ class Index(object):
         same = []
         similar = []
 
-        # there are few files with this size so no hash was computed
-        if src_hash is None:
-            similar.extend(paths)
-            return same, similar
-        # if src_hash exist then all files in size group should have it computed
-
         for p in paths:
             ex = self._info_by_path[p]["extent"]
             if ex == src_extent:
                 same.append(p)
             else:
-                if self._hash_by_extent[ex] == src_hash:
+                # there are few files with this size so no hash was computed
+                # if src_hash exist then all files in size group should have it computed
+                if src_hash is None or self._hash_by_extent[ex] == src_hash:
                     similar.append(p)
         
         return same, similar
