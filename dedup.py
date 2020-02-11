@@ -442,14 +442,23 @@ class Deduplicator(object):
                     break
                 offset += batch_size
 
+class TqdmLoggingHandler(logging.Handler):
+    def __init__(self, bar, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._bar = bar
+    def emit(self, record):
+        bar.write(self.format(record))
+
+
 if __name__ == "__main__":
     import tqdm
-    logging.basicConfig(level=logging.ERROR)
+    log_levels=[logging.ERROR, logging.WARNING, logging.INFO, logging.DEBUG]
 
     p = argparse.ArgumentParser()
     p.add_argument("--pretend", "-p", action="store_true")
     p.add_argument("--hash-workers", action="store", type=int, default=math.ceil(os.cpu_count()/2))
     p.add_argument("--hash-batch-size", action="store", type=int, default=200)
+    p.add_argument("--verbose", "-v", action="count", default=0)
     p.add_argument("path", action="store", type=pathlib.Path)
 
     def format_bytes(s):
@@ -457,11 +466,17 @@ if __name__ == "__main__":
     
     ns = p.parse_args()
 
+    bar = tqdm.tqdm(desc="Scanning", unit=" files", leave=False)
+
+    log_level = log_levels[min(ns.verbose, len(log_levels)-1)]
+
+    handler = TqdmLoggingHandler(bar)
+    handler.setFormatter(logging.Formatter(logging.BASIC_FORMAT))
+    logging.root.addHandler(handler)
+    logging.root.setLevel(log_level)
+
     index = Index()
     d = Deduplicator(pretend=ns.pretend, index=index)
-
-    # bar_steps = tqdm.tqdm(unit=" step")
-    bar = tqdm.tqdm(desc="Scanning", unit=" files", leave=False)
     
     def collect_progress(found, added):
         bar.n = found
