@@ -177,6 +177,25 @@ def get_extent_map(fd, range_end = None):
     
     return tuple(ret)
 
+class Progress(object):
+    def __init__(self, on_update):
+        super().__init__()
+        self._state = {}
+        self.on_update = on_update
+    
+    def update(self, **kwargs):
+        for k,v in kwargs.items():
+            if k.endswith("__add"):
+                k = k[:-5]
+                self._state[k] += v
+            else:
+                self._state[k] = v
+        if self.on_update:
+            self.on_update(**self._state)
+    
+    def __getattr__(self, name):
+        return self._state[name]
+
 class Index(object):
     BUFSIZE = 1024 * 1024
 
@@ -207,10 +226,14 @@ class Index(object):
             "extent": first_extent,
         }
 
-    def collect_files(self, path):
+    def collect_files(self, path, progress=None):
         self.logger.info("Creating index for %r", path)
+        if progress:
+            progress.update(found=0, added=0)
         for root, dummy_, files in os.walk(path):
             for fname in files:
+                if progress:
+                    progress.update(found__add=1)
                 f = pathlib.Path(root) / fname
                 with fdopen(f, os.O_PATH|os.O_NOFOLLOW) as fd:
                     s = os.fstat(fd)
@@ -231,6 +254,8 @@ class Index(object):
                     continue
                 
                 self.put(f, info)
+                if progress:
+                    progress.update(added__add=1)
     
     @classmethod
     def _calculate_hash(cls, path):
@@ -247,29 +272,41 @@ class Index(object):
     def _hash_collector_worker(cls, infos):
         ret = []
         for extent, path in infos:
-            ret.append((extent, cls._calculate_hash(path)))
+            ret.append((path, extent, cls._calculate_hash(path)))
         return ret
 
-    def collect_hashes(self, workers=None, batch_size=200):
+    def collect_hashes(self, workers=None, batch_size=200, progress=None):
         self.logger.info("Collecting hashes")
-        progress_tracker = {
-            "total": len(self._info_by_path),
-            "skipped": 0,
-            "hashed": 0
-        }
+        
+        if progress:
+            progress.update(
+                total_files=len(self._info_by_path),
+                skipped_files=0,
+                hashed_files=0,
+
+                total_bytes=sum(i["size"] for i in self._info_by_path.values()),
+                hashed_bytes=0,
+                skipped_bytes=0,
+            )
+
         def path_iter():
             known_extents = set()
             for ps in self._path_by_size.values():
                 # calculate hash only if there is need for comparison
                 if len(ps) < 3:
+                    if progress:
+                        progress.update(skipped_files__add=len(ps), skipped_bytes__add=sum(self._info_by_path[p]["size"] for p in ps))
                     continue
                 for p in ps:
-                    extent_offset = self._info_by_path[p]["extent"]
+                    info = self._info_by_path[p]
+                    extent_offset = info["extent"]
                     if extent_offset in known_extents:
-                        progress_tracker["skipped"]+=1
+                        if progress:
+                            progress.update(skipped_files__add=1, skipped_bytes__add=info["size"])
                         continue
                     known_extents.add(extent_offset)
                     yield extent_offset, p
+        
         def hash_iter(batch_size):
             i = path_iter()
             while True:
@@ -280,11 +317,12 @@ class Index(object):
         
         with multiprocessing.pool.Pool(workers) as pool:
             for batch in pool.imap_unordered(self._hash_collector_worker, hash_iter(batch_size)):
-                for extent, hash_ in batch:
+                for path, extent, hash_ in batch:
                     if extent not in self._hash_by_extent:
                         self._hash_by_extent[extent] = {}
                     self._hash_by_extent[extent] = hash_
-                    progress_tracker["hashed"]+=1
+                    if progress:
+                        progress.update(hashed_files__add=1, hashed_bytes__add=self._info_by_path[path]["size"])
 
     def __iter__(self):
         return iter(self._info_by_path.keys())
@@ -325,11 +363,20 @@ class Deduplicator(object):
         self.pretend = pretend
         self.index = index
 
-    def run(self):
+    def run(self, progress=None):
         handled = set()
-        deduplicated_files = 0
-        deduplicated_bytes = 0
         
+        if progress:
+            progress.update(
+                total_files=len(self.index),
+                handled_files=0,
+                deduped_files=0,
+                deduped_bytes=0,
+                same_files=0,
+                same_bytes=0,
+                duplicated_files=0
+            )
+
         for src_path in self.index:
             if src_path in handled:
                 continue
@@ -339,6 +386,13 @@ class Deduplicator(object):
             same, similar = self.index.find_similar(src_path)
             handled.update(same)
             handled.add(src_path)
+            if progress:
+                progress_src_size = self.index.get_size(src_path)
+                progress.update(
+                    same_files__add=len(same),
+                    same_bytes__add=len(same) * progress_src_size,
+                    duplicated_files__add=1
+                )
 
             self.logger.debug("Found %d same and %d similar files", len(same), len(similar))
 
@@ -349,16 +403,24 @@ class Deduplicator(object):
                     self.logger.debug("Found duplicate: %r", p)
                     pending.append(p)
                     handled.add(p)
-                    deduplicated_files += 1
+                    if progress:
+                        progress.update(deduped_files__add=1)
             
             if pending:
                 if not self.pretend:
                     self._run_dedupe(src_path, pending)
-                deduplicated_bytes += len(pending) * self.index.get_size(src_path)
+                if progress:
+                    progress.update(
+                        deduped_files__add=len(pending),
+                        deduped_bytes__add=len(pending) * progress_src_size,
+                        duplicated_files__add=1
+                    )
+            
+            if progress:
+                progress.update(handled_files=len(handled))
 
-
-        self.logger.debug("Deduplicated %.2f MBytes in %d files.", deduplicated_bytes/1024/1024, deduplicated_files)
-
+        # self.logger.debug("Deduplicated %.2f MBytes in %d files.", progress.deduped_bytes/1024/1024, progress.deduped_files)
+        # return progress
 
     def _run_dedupe(self, src_path, dst_paths, batch_size=10):
         size = self.index.get_size(src_path)
@@ -381,19 +443,80 @@ class Deduplicator(object):
                 offset += batch_size
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG)
+    import tqdm
+    logging.basicConfig(level=logging.ERROR)
 
     p = argparse.ArgumentParser()
     p.add_argument("--pretend", "-p", action="store_true")
     p.add_argument("--hash-workers", action="store", type=int, default=math.ceil(os.cpu_count()/2))
     p.add_argument("--hash-batch-size", action="store", type=int, default=200)
     p.add_argument("path", action="store", type=pathlib.Path)
+
+    def format_bytes(s):
+        return tqdm.tqdm.format_sizeof(s, 'b', 1024)
     
     ns = p.parse_args()
 
     index = Index()
-    index.collect_files(ns.path)
-    index.collect_hashes(workers=ns.hash_workers, batch_size=ns.hash_batch_size)
-
     d = Deduplicator(pretend=ns.pretend, index=index)
-    d.run()
+
+    # bar_steps = tqdm.tqdm(unit=" step")
+    bar = tqdm.tqdm(desc="Scanning", unit=" files", leave=False)
+    
+    def collect_progress(found, added):
+        bar.n = found
+        bar.update(0)
+    progress = Progress(collect_progress)
+    index.collect_files(ns.path, progress=progress)
+    bar.write("Indexed %d files from %d found in %ss" % (progress.added, progress.found, bar.format_interval(bar.last_print_t - bar.start_t)))
+
+    bar.desc = "Calculating hashes"
+    bar.unit="b"
+    bar.unit_divisor=1024
+    bar.unit_scale=True
+    bar.miniters = 0
+    bar.reset(1)
+    
+    def hash_progress(total_bytes, skipped_bytes, hashed_bytes, **kwargs):
+        bar.total = total_bytes
+        bar.n = skipped_bytes + hashed_bytes
+        bar.update(0)
+    progress = Progress(hash_progress)
+    index.collect_hashes(workers=ns.hash_workers, batch_size=ns.hash_batch_size, progress=progress)
+    bar.write(
+        "Hashed %s of %s from %d files in %ss" % (
+            format_bytes(progress.hashed_bytes),
+            format_bytes(progress.total_bytes),
+            progress.total_files,
+            bar.format_interval(bar.last_print_t - bar.start_t)
+        )
+    )
+    
+    bar.desc = "Deduplicating"
+    bar.unit = " files"
+    bar.unit_scale = False
+    bar.miniters = 0
+    bar.reset(1)
+    
+    def dedup_progress(total_files, handled_files, **kwargs):
+        bar.total = total_files
+        bar.n = handled_files
+        bar.update(0)
+    progress=Progress(dedup_progress)
+    d.run(progress=progress)
+    
+    bar.close()
+
+    bar.write("""Deduplicate stats:
+  - checked {handled_files} files
+  - found {duplicated_files} files that have duplicates
+  - deduplicated {deduped_bytes} in {deduped_files} files
+  - found {same_bytes} of already deduplicated data in {same_files} files
+    """.format(
+        handled_files=progress.handled_files,
+        duplicated_files=progress.duplicated_files,
+        deduped_files=progress.deduped_files,
+        deduped_bytes=format_bytes(progress.deduped_bytes),
+        same_bytes=format_bytes(progress.same_bytes),
+        same_files=progress.same_files
+    ))
