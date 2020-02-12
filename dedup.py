@@ -391,7 +391,6 @@ class Deduplicator(object):
                 progress.update(
                     same_files__add=len(same),
                     same_bytes__add=len(same) * progress_src_size,
-                    duplicated_files__add=1
                 )
 
             self.logger.debug("Found %d same and %d similar files", len(same), len(similar))
@@ -413,14 +412,13 @@ class Deduplicator(object):
                     progress.update(
                         deduped_files__add=len(pending),
                         deduped_bytes__add=len(pending) * progress_src_size,
-                        duplicated_files__add=1
                     )
             
             if progress:
-                progress.update(handled_files=len(handled))
-
-        # self.logger.debug("Deduplicated %.2f MBytes in %d files.", progress.deduped_bytes/1024/1024, progress.deduped_files)
-        # return progress
+                progress.update(
+                    handled_files=len(handled),
+                    duplicated_files__add=1 if same or pending else 0
+                )
 
     def _run_dedupe(self, src_path, dst_paths, batch_size=10):
         size = self.index.get_size(src_path)
@@ -524,7 +522,7 @@ if __name__ == "__main__":
 
     bar.write("""Deduplicated {deduped_bytes} in {run_time}s:
   - checked {handled_files} files
-  - found {duplicated_files} files that have duplicates
+  - found {duplicated_files} unique files that have duplicates
   - deduplicated {deduped_bytes} in {deduped_files} files
   - found {same_bytes} of already deduplicated data in {same_files} files
     """.format(
