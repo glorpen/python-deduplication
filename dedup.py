@@ -228,6 +228,10 @@ class Index(object):
 
     def collect_files(self, path, progress=None):
         self.logger.info("Creating index for %r", path)
+
+        pref_block_size = os.stat(path / ".").st_blksize
+        self.logger.info("Checking files bigger or equal to %d bytes", pref_block_size)
+
         if progress:
             progress.update(found=0, added=0)
         for root, dummy_, files in os.walk(path):
@@ -240,8 +244,8 @@ class Index(object):
                 if stat.S_IFMT(s.st_mode) != stat.S_IFREG:
                     self.logger.warning("Skipping not regular file at %r", f)
                     continue
-                if s.st_size == 0:
-                    self.logger.debug("Skipping empty file at %r", f)
+                if s.st_size < pref_block_size:
+                    self.logger.debug("Skipping empty or small file at %r", f)
                     continue
                 try:
                     with fdopen(f, os.O_RDONLY) as fd:
