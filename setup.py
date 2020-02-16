@@ -1,3 +1,7 @@
+'''
+@author: Arkadiusz Dzięgiel <arkadiusz.dziegiel@glorpen.pl>
+'''
+
 import os
 import re
 from setuptools import setup, find_packages

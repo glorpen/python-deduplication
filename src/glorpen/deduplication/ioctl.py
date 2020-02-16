@@ -1,3 +1,7 @@
+'''
+@author: Arkadiusz Dzięgiel <arkadiusz.dziegiel@glorpen.pl>
+'''
+
 import contextlib
 import ctypes
 import fcntl
