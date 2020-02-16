@@ -149,7 +149,7 @@ class Index(object):
             while True:
                 ret = list(itertools.islice(i, batch_size))
                 if not ret:
-                    raise StopIteration()
+                    return
                 yield ret
         
         with multiprocessing.pool.Pool(workers) as pool:

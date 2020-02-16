@@ -17,7 +17,7 @@ class TqdmLoggingHandler(logging.Handler):
         super().__init__(*args, **kwargs)
         self._bar = bar
     def emit(self, record):
-        bar.write(self.format(record))
+        self._bar.write(self.format(record))
 
 def collect_progress(bar, found, added):
     bar.n = found
@@ -33,12 +33,12 @@ def dedup_progress(bar, total_files, handled_files, **kwargs):
     bar.n = handled_files
     bar.update(0)
 
-def run_collect_files(bar, index):
+def run_collect_files(bar, index, path):
     progress = Progress(functools.partial(collect_progress, bar=bar))
-    index.collect_files(ns.path, progress=progress)
+    index.collect_files(path, progress=progress)
     bar.write("Indexed %d files from %d found in %ss" % (progress.added, progress.found, bar.format_interval(bar.last_print_t - bar.start_t)))
 
-def run_calculate_hashes(bar, index):
+def run_calculate_hashes(bar, index, hash_workers, hash_batch_size):
     bar.desc = "Calculating hashes"
     bar.unit="b"
     bar.unit_divisor=1024
@@ -47,7 +47,7 @@ def run_calculate_hashes(bar, index):
     bar.reset(1)
     
     progress = Progress(functools.partial(hash_progress, bar=bar))
-    index.collect_hashes(workers=ns.hash_workers, batch_size=ns.hash_batch_size, progress=progress)
+    index.collect_hashes(workers=hash_workers, batch_size=hash_batch_size, progress=progress)
     bar.write(
         "Hashed %s of %s from %d files in %ss" % (
             format_bytes(progress.hashed_bytes),
@@ -84,7 +84,7 @@ def run_deduplicate(bar, dedup):
         run_time=bar.format_interval(bar.last_print_t - bar.start_t)
     ))
 
-if __name__ == "__main__":
+def execute():
     log_levels=[logging.ERROR, logging.WARNING, logging.INFO, logging.DEBUG]
 
     p = argparse.ArgumentParser()
@@ -108,7 +108,10 @@ if __name__ == "__main__":
     index = Index()
     d = Deduplicator(pretend=ns.pretend, index=index)
 
-    run_collect_files(bar, index)
-    run_calculate_hashes(bar, index)
+    run_collect_files(bar, index, ns.path)
+    run_calculate_hashes(bar, index, ns.hash_workers, ns.hash_batch_size)
     run_deduplicate(bar, d)
     
+
+if __name__ == "__main__":
+    execute()
